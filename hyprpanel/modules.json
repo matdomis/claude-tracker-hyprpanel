@@ -1,0 +1,12 @@
+{
+  "custom/claude-tracker": {
+    "icon": " ",
+    "label": "",
+    "tooltip": "Claude usage",
+    "truncationSize": 0,
+    "actions": {
+      "onLeftClick": "@BIN@/claude-tracker"
+    },
+    "hideOnEmpty": false
+  }
+}

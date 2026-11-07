@@ -1,0 +1,779 @@
+#!/usr/bin/python3
+"""claude-tracker: an 8-bit usage menu for HyprPanel on Hyprland.
+
+Shows Claude Code and Codex plan usage (5-hour and weekly windows) for one or
+more accounts. Click the bar button to open it; it fetches fresh usage every
+time it opens. Click outside it or press Escape to close it. Running the
+command again while it is open also closes it.
+
+Accounts are listed in ~/.config/claude-tracker/config.toml.
+"""
+
+import os
+import signal
+import sys
+
+# Toggle: if the menu is already open, close it and stop here (before loading GTK).
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "claude-tracker.pid")
+if "CLAUDE_TRACKER_CHILD" not in os.environ:
+    try:
+        with open(PIDFILE) as f:
+            old = int(f.read().strip())
+        with open(f"/proc/{old}/cmdline", "rb") as f:
+            if b"claude-tracker" in f.read():
+                os.kill(old, signal.SIGTERM)
+                sys.exit(0)
+    except (OSError, ValueError):
+        pass
+
+# gtk4-layer-shell must load before libwayland-client, so re-exec with it preloaded.
+LAYER_SHELL = next((p for p in (
+    "/usr/lib/libgtk4-layer-shell.so",
+    "/usr/lib64/libgtk4-layer-shell.so",
+    "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+    "/usr/lib/aarch64-linux-gnu/libgtk4-layer-shell.so",
+    "/usr/local/lib/libgtk4-layer-shell.so",
+) if os.path.exists(p)), None)
+if LAYER_SHELL and LAYER_SHELL not in os.environ.get("LD_PRELOAD", ""):
+    env = dict(os.environ, LD_PRELOAD=LAYER_SHELL, CLAUDE_TRACKER_CHILD="1")
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+import json
+import re
+import selectors
+import shutil
+import subprocess
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix  # noqa: E402
+except (ImportError, ValueError):
+    GLibUnix = None
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache"))
+CONFIG = CONFIG_HOME / "claude-tracker/config.toml"
+CACHE = CACHE_HOME / "claude-tracker.json"
+HYPRPANEL_CONFIG = CONFIG_HOME / "hyprpanel/config.json"
+# Assets next to the script (running from the repo) or where install.sh put them.
+ASSETS = next((p for p in (Path(__file__).resolve().parent / "assets", DATA_HOME / "claude-tracker")
+               if p.is_dir()), DATA_HOME / "claude-tracker")
+
+USAGE_URLS = {
+    "claude": "https://claude.ai/settings/usage",
+    "codex": "https://chatgpt.com/codex/settings/usage",
+}
+
+
+def load_accounts():
+    """Read the account list from config.toml, or fall back to sensible defaults."""
+    entries = None
+    try:
+        with open(CONFIG, "rb") as f:
+            entries = tomllib.load(f).get("account")
+    except FileNotFoundError:
+        pass
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        print(f"claude-tracker: ignoring {CONFIG}: {error}", file=sys.stderr)
+    if not entries:
+        entries = [{"type": "claude", "label": "Claude", "config_dir": "~/.claude"}]
+        if shutil.which("codex"):
+            entries.append({"type": "codex", "label": "Codex"})
+
+    accounts = []
+    for i, entry in enumerate(entries):
+        kind = entry.get("type", "claude")
+        if kind not in USAGE_URLS:
+            print(f"claude-tracker: unknown account type {kind!r}, skipping", file=sys.stderr)
+            continue
+        label = str(entry.get("label", kind.title()))
+        sub = str(entry.get("sublabel", ""))
+        slug = re.sub(r"[^a-z0-9]+", "-", f"{kind}-{label}-{sub}".lower()).strip("-")
+        accounts.append({
+            "id": f"{i}-{slug}",
+            "kind": kind,
+            "name": label.upper(),
+            "sub": sub.upper(),
+            "dir": Path(os.path.expanduser(entry.get("config_dir", "~/.claude"))),
+            "command": entry.get("command", "codex"),
+            "url": entry.get("url", USAGE_URLS[kind]),
+        })
+    return accounts
+
+
+ACCOUNTS = load_accounts()
+
+SEGMENTS = 20
+SEG_W, SEG_H, SEG_GAP = 6, 10, 2
+CARD_W = 392
+PX = 2  # one "pixel" of the 8-bit frame, in screen pixels
+# Each click fetches fresh data, unless the last fetch is this recent. Anthropic's
+# usage endpoint rate-limits for a few minutes when it is hit too often.
+MIN_REFETCH_SECONDS = 30
+
+
+# ---------------------------------------------------------------- theme
+
+def theme():
+    """Colors follow the HyprPanel theme, so the menu changes with it."""
+    t = {
+        "bg": "#130d07", "card": "#19120c", "text": "#eee0d5", "accent": "#fbba74",
+        "track": "#3b332c", "hover": "#251e17",
+    }
+    try:
+        cfg = json.loads(HYPRPANEL_CONFIG.read_text())
+        t["bg"] = cfg.get("theme.bar.menus.background", t["bg"])
+        t["card"] = cfg.get("theme.bar.menus.cards", t["card"])
+        t["text"] = cfg.get("theme.bar.menus.text", t["text"])
+        t["accent"] = cfg.get("theme.bar.menus.label", t["accent"])
+        t["track"] = cfg.get("theme.bar.menus.progressbar.background", t["track"])
+        t["hover"] = cfg.get("theme.bar.buttons.background", t["hover"])
+    except Exception:
+        pass
+    # Secondary text: a mix of text and background that stays above 4.5:1.
+    t["muted"] = mix(t["text"], t["bg"], 0.62)
+    t["warn"] = "#ff9e57"
+    t["danger"] = "#ff6e5e"
+    return t
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def mix(a, b, amount):
+    ra, rb = hex_rgb(a), hex_rgb(b)
+    return "#" + "".join(f"{round((x * amount + y * (1 - amount)) * 255):02x}" for x, y in zip(ra, rb))
+
+
+def level_color(t, pct):
+    if pct >= 80:
+        return t["danger"]
+    if pct >= 50:
+        return t["warn"]
+    return t["accent"]
+
+
+# ---------------------------------------------------------------- data
+
+def fetch_claude(account):
+    creds_path = account["dir"] / ".credentials.json"
+    try:
+        oauth = json.loads(creds_path.read_text())["claudeAiOauth"]
+    except Exception:
+        return {"status": "error", "message": "NOT LOGGED IN"}
+    plan = (oauth.get("subscriptionType") or "").upper()
+    if oauth.get("expiresAt", 0) / 1000 < time.time():
+        return {"status": "expired", "plan": plan, "message": "LOGIN EXPIRED - OPEN CLAUDE"}
+    request = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {oauth['accessToken']}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-tracker/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            return {"status": "expired", "plan": plan, "message": "LOGIN EXPIRED - OPEN CLAUDE"}
+        if error.code == 429:
+            try:
+                wait = int(error.headers.get("Retry-After", "120"))
+            except ValueError:
+                wait = 120
+            return {"status": "limited", "plan": plan, "retry_at": time.time() + wait}
+        return {"status": "error", "plan": plan, "message": f"SERVER ERROR {error.code}"}
+    except Exception:
+        return {"status": "error", "plan": plan, "message": "OFFLINE"}
+
+    def window(key):
+        w = data.get(key) or {}
+        if w.get("utilization") is None:
+            return None
+        resets = w.get("resets_at")
+        ts = datetime.fromisoformat(resets).timestamp() if resets else None
+        return {"pct": round(w["utilization"]), "resets": ts}
+
+    return {"status": "ok", "plan": plan, "five": window("five_hour"), "week": window("seven_day")}
+
+
+def fetch_codex(account):
+    """Ask the Codex CLI's app-server for rate limits."""
+    codex = shutil.which(account["command"])
+    if not codex:
+        return {"status": "error", "message": "CODEX NOT FOUND"}
+    try:
+        process = subprocess.Popen(
+            [codex, "app-server", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+    except OSError:
+        return {"status": "error", "message": "CODEX NOT FOUND"}
+
+    def send(message):
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        send({"id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "claude-tracker", "version": "1.0.0"}, "capabilities": None}})
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if not selector.select(deadline - time.monotonic()):
+                break
+            line = process.stdout.readline()
+            if not line:
+                break
+            message = json.loads(line)
+            if message.get("id") == 1:
+                if "error" in message:
+                    return {"status": "error", "message": "CODEX LOGIN NEEDED"}
+                send({"method": "initialized"})
+                send({"id": 2, "method": "account/rateLimits/read"})
+            elif message.get("id") == 2:
+                if "error" in message:
+                    return {"status": "error", "message": "CODEX LOGIN NEEDED"}
+                limits = message["result"]["rateLimits"]
+
+                def window(w):
+                    if not w:
+                        return None
+                    return {"pct": round(w["usedPercent"]), "resets": w.get("resetsAt")}
+
+                return {"status": "ok", "plan": (limits.get("planType") or "").upper(),
+                        "five": window(limits.get("primary")), "week": window(limits.get("secondary"))}
+        return {"status": "error", "message": "CODEX TIMED OUT"}
+    except Exception:
+        return {"status": "error", "message": "CODEX ERROR"}
+    finally:
+        selector.close()
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def load_cache():
+    try:
+        return json.loads(CACHE.read_text())
+    except Exception:
+        return {}
+
+
+def save_cache(cache):
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        os.replace(tmp, CACHE)
+    except Exception:
+        pass
+
+
+def until(ts):
+    if not ts:
+        return "--"
+    seconds = max(0, int(ts - time.time()))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}D {hours}H"
+    if hours:
+        return f"{hours}H {minutes:02d}M"
+    if minutes:
+        return f"{minutes}M"
+    return "<1M"
+
+
+def until_spoken(ts):
+    text = until(ts).replace("<1M", "less than a minute")
+    return text.replace("D", " days").replace("H", " hours").replace("M", " minutes")
+
+
+# ---------------------------------------------------------------- placement
+
+def hypr_json(command):
+    """Query Hyprland over its IPC socket (much faster than spawning hyprctl)."""
+    import socket
+    path = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "hypr" / os.environ.get(
+        "HYPRLAND_INSTANCE_SIGNATURE", "") / ".socket.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            sock.connect(str(path))
+            sock.sendall(f"j/{command}".encode())
+            chunks = []
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+    except Exception:
+        return None
+
+
+def placement():
+    """Monitor under the cursor, cursor x on it, and the bar height there."""
+    monitors = hypr_json("monitors") or []
+    cursor = hypr_json("cursorpos") or {"x": 0, "y": 0}
+    cx, cy = cursor.get("x", 0), cursor.get("y", 0)
+    mon = next((m for m in monitors if m["x"] <= cx < m["x"] + m["width"] / m["scale"]
+                and m["y"] <= cy < m["y"] + m["height"] / m["scale"]), monitors[0] if monitors else None)
+    if mon is None:
+        return None, 0, 1920, 47
+    bar_h = 47
+    layers = hypr_json("layers") or {}
+    for level in layers.get(mon["name"], {}).get("levels", {}).values():
+        for layer in level:
+            if layer["namespace"].startswith("bar-"):
+                bar_h = layer["h"]
+    width = int(mon["width"] / mon["scale"])
+    return mon["name"], int(cx - mon["x"]), width, bar_h
+
+
+# ---------------------------------------------------------------- widgets
+
+class Frame(Gtk.DrawingArea):
+    """The 8-bit box: stepped corners and a 2px pixel border."""
+
+    def __init__(self, colors):
+        super().__init__()
+        self.colors = colors
+        self.set_draw_func(self.draw)
+
+    def draw(self, _area, cr, w, h):
+        def fill(color, x, y, rw, rh):
+            cr.set_source_rgb(*hex_rgb(color))
+            cr.rectangle(x, y, rw, rh)
+            cr.fill()
+
+        c = self.colors
+        u = PX
+        fill(c["bg"], u, u, w - 2 * u, h - 2 * u)
+        border = c["accent"]
+        fill(border, 2 * u, 0, w - 4 * u, u)          # top
+        fill(border, 2 * u, h - u, w - 4 * u, u)      # bottom
+        fill(border, 0, 2 * u, u, h - 4 * u)          # left
+        fill(border, w - u, 2 * u, u, h - 4 * u)      # right
+        for x, y in ((u, u), (w - 2 * u, u), (u, h - 2 * u), (w - 2 * u, h - 2 * u)):
+            fill(border, x, y, u, u)                  # stepped corners
+
+
+class Meter(Gtk.DrawingArea):
+    """Segmented pixel bar. Fills segment by segment when the value changes."""
+
+    def __init__(self, colors):
+        super().__init__()
+        self.colors = colors
+        self.value = 0.0
+        self.target = 0
+        self.dim = False
+        self.anim = None
+        self.set_content_width(SEGMENTS * SEG_W + (SEGMENTS - 1) * SEG_GAP)
+        self.set_content_height(SEG_H)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self.draw)
+
+    def set_value(self, pct, dim=False, animate=True):
+        self.dim = dim
+        self.target = pct
+        settings = Gtk.Settings.get_default()
+        if not animate or not settings.get_property("gtk-enable-animations"):
+            self.value = pct
+            self.queue_draw()
+            return
+        self.anim = (self.value, pct, None)
+        self.add_tick_callback(self.tick)
+
+    def tick(self, _widget, clock):
+        if self.anim is None:
+            return GLib.SOURCE_REMOVE
+        start, end, t0 = self.anim
+        now = clock.get_frame_time() / 1e6
+        if t0 is None:
+            self.anim = (start, end, now)
+            t0 = now
+        p = min(1.0, (now - t0) / 0.26)
+        eased = 1 - (1 - p) ** 3
+        self.value = start + (end - start) * eased
+        self.queue_draw()
+        if p >= 1.0:
+            self.anim = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def draw(self, _area, cr, _w, _h):
+        c = self.colors
+        lit = round(self.value / 100 * SEGMENTS)
+        if self.value > 0 and lit == 0:
+            lit = 1
+        on = level_color(c, self.target)
+        if self.dim:
+            on = mix(on, c["bg"], 0.45)
+        for i in range(SEGMENTS):
+            cr.set_source_rgb(*hex_rgb(on if i < lit else c["track"]))
+            cr.rectangle(i * (SEG_W + SEG_GAP), 0, SEG_W, SEG_H)
+            cr.fill()
+
+
+class AccountCard(Gtk.Button):
+    def __init__(self, account, colors):
+        super().__init__()
+        self.account = account
+        self.colors = colors
+        self.add_css_class("um-account")
+        self.set_tooltip_text("Open the usage page")
+        self.connect("clicked", self.open_page)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        head = Gtk.Box(spacing=8)
+        name = Gtk.Label(label=account["name"], xalign=0)
+        name.add_css_class("um-name")
+        head.append(name)
+        if account["sub"]:
+            sub = Gtk.Label(label=account["sub"], xalign=0)
+            sub.add_css_class("um-sub")
+            head.append(sub)
+        spacer = Gtk.Box(hexpand=True)
+        head.append(spacer)
+        self.plan = Gtk.Label(label="")
+        self.plan.add_css_class("um-plan")
+        self.plan.set_visible(False)
+        head.append(self.plan)
+        box.append(head)
+
+        self.rows = {}
+        for key, label in (("five", "5H"), ("week", "WEEK")):
+            row = Gtk.Box(spacing=10)
+            tag = Gtk.Label(label=label, xalign=0, width_chars=4)
+            tag.add_css_class("um-tag")
+            meter = Meter(colors)
+            pct = Gtk.Label(label="--%", xalign=1, width_chars=4)
+            pct.add_css_class("um-pct")
+            reset = Gtk.Label(label="", xalign=1, width_chars=7, hexpand=True)
+            reset.add_css_class("um-reset")
+            for w in (tag, meter, pct, reset):
+                row.append(w)
+            box.append(row)
+            self.rows[key] = (meter, pct, reset)
+
+        self.message = Gtk.Label(label="", xalign=0, wrap=True)
+        self.message.add_css_class("um-message")
+        self.message.set_visible(False)
+        box.append(self.message)
+        self.set_child(box)
+
+    def open_page(self, _button):
+        Gio.AppInfo.launch_default_for_uri(self.account["url"], None)
+        self.get_root().get_application().quit()
+
+    def show(self, data, stale=False, note=None, severity="warn", plan=None, animate=True):
+        """data: last good usage (or None). note: a problem to show under the bars."""
+        plan = plan or (data or {}).get("plan") or ""
+        self.plan.set_label(plan)
+        self.plan.set_visible(bool(plan))
+        spoken = [f"{self.account['name'].title()} {self.account['sub'].lower()}".strip()]
+        for key, (meter, pct, reset) in self.rows.items():
+            w = (data or {}).get(key)
+            if w:
+                meter.set_value(w["pct"], dim=stale, animate=animate)
+                pct.set_label(f"{w['pct']}%")
+                reset.set_label(until(w["resets"]))
+                name = "5 hour" if key == "five" else "weekly"
+                spoken.append(f"{name} {w['pct']} percent used, resets in {until_spoken(w['resets'])}")
+            else:
+                meter.set_value(0, animate=False)
+                pct.set_label("--%")
+                reset.set_label("")
+            for widget in (pct, reset):
+                if stale:
+                    widget.add_css_class("um-stale")
+                else:
+                    widget.remove_css_class("um-stale")
+        if note:
+            self.message.set_label(note)
+            self.message.remove_css_class("um-warn" if severity == "danger" else "um-danger")
+            self.message.add_css_class(f"um-{severity}")
+            spoken.append(note.lower())
+        self.message.set_visible(bool(note))
+        if stale and data:
+            spoken.append("showing the last known numbers")
+        self.update_property([Gtk.AccessibleProperty.LABEL], [". ".join(spoken) + ". Opens the usage page."])
+
+
+class UsageMenu(Gtk.Application):
+    def __init__(self):
+        # No application id: skips D-Bus registration (~200ms). The PID file handles toggling.
+        super().__init__()
+        self.window = None
+        self.cache = load_cache()
+        if not ACCOUNTS:
+            print(f"claude-tracker: no accounts configured in {CONFIG}", file=sys.stderr)
+        self.pending = 0
+        self.dots = 0
+
+    def do_activate(self):
+        if self.window is not None:
+            return
+        try:
+            with open(PIDFILE, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+        signal_add = getattr(GLibUnix, "signal_add", None) or GLib.unix_signal_add
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: self.quit() or False)
+        self.colors = theme()
+        self.install_css()
+        self.build()
+
+    def install_css(self):
+        c = self.colors
+        css = f"""
+        window.claude-tracker {{ background: transparent; }}
+        .um-card {{ padding: {6 * PX}px {8 * PX}px; opacity: 0; transform: translateY(-6px);
+                 transition: opacity 140ms cubic-bezier(0.23, 1, 0.32, 1),
+                             transform 160ms cubic-bezier(0.23, 1, 0.32, 1); }}
+        .um-card.um-shown {{ opacity: 1; transform: none; }}
+        .um-card label {{ font-family: "Silkscreen"; font-size: 16px; color: {c["text"]}; }}
+        .um-card label.um-title {{ font-family: "Press Start 2P"; font-size: 16px; color: {c["accent"]}; }}
+        .um-card label.um-status {{ color: {c["muted"]}; }}
+        .um-card label.um-name {{ font-weight: bold; color: {c["text"]}; }}
+        .um-card label.um-sub {{ font-weight: bold; color: {c["accent"]}; }}
+        .um-card label.um-plan {{ color: {c["accent"]}; padding: 0 4px; }}
+        .um-card label.um-tag, .um-card label.um-reset {{ color: {c["muted"]}; }}
+        .um-card label.um-pct {{ color: {c["text"]}; }}
+        .um-card label.um-pct.um-stale {{ color: {c["muted"]}; }}
+        .um-card label.um-message.um-warn {{ color: {c["warn"]}; }}
+        .um-card label.um-message.um-danger {{ color: {c["danger"]}; }}
+        .um-card label.um-hint {{ color: {c["muted"]}; }}
+        .um-rule {{ background: {c["track"]}; min-height: {PX}px; margin: 0 2px; }}
+        button.um-account {{ background: none; border: none; box-shadow: none; border-radius: 0;
+                          padding: 10px 8px; outline: none; }}
+        button.um-account:hover {{ background: {c["hover"]}; }}
+        button.um-account:active {{ background: {mix(c["hover"], c["accent"], 0.85)}; }}
+        button.um-account:focus-visible {{ outline: {PX}px solid {c["accent"]}; outline-offset: -{PX}px; }}
+        """
+        provider = Gtk.CssProvider()
+        provider.connect("parsing-error", lambda _p, section, error: print(
+            f"css: {section.to_string()}: {error.message}", file=sys.stderr))
+        provider.load_from_string(css)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10)
+        settings = Gtk.Settings.get_default()
+        # Pixel fonts look crisp only without subpixel smoothing.
+        try:
+            settings.set_property("gtk-font-rendering", Gtk.FontRendering.MANUAL)
+            settings.set_property("gtk-xft-antialias", 0)
+            settings.set_property("gtk-hint-font-metrics", True)
+        except Exception:
+            pass
+
+    def build(self):
+        monitor_name, cursor_x, mon_w, bar_h = placement()
+        win = Gtk.ApplicationWindow(application=self, title="Claude tracker")
+        win.add_css_class("claude-tracker")
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "claude-tracker")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, True)
+        LayerShell.set_exclusive_zone(win, -1)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.EXCLUSIVE)
+        if monitor_name:
+            monitors = Gdk.Display.get_default().get_monitors()
+            for i in range(monitors.get_n_items()):
+                m = monitors.get_item(i)
+                if m.get_connector() == monitor_name:
+                    LayerShell.set_monitor(win, m)
+
+        x = os.environ.get("CLAUDE_TRACKER_X")  # pin the menu's left edge (testing)
+        x = int(x) if x else cursor_x - CARD_W // 2
+        x = max(8, min(x, mon_w - CARD_W - 8))
+
+        overlay = Gtk.Overlay()
+        frame = Frame(self.colors)
+        overlay.set_child(frame)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("um-card")
+        overlay.add_overlay(card)
+        overlay.set_measure_overlay(card, True)
+        overlay.set_size_request(CARD_W, -1)
+        overlay.set_halign(Gtk.Align.START)
+        overlay.set_valign(Gtk.Align.START)
+        overlay.set_margin_start(x)
+        overlay.set_margin_top(bar_h + 8)
+        self.card, self.panel = card, overlay
+
+        head = Gtk.Box(spacing=10)
+        head.set_margin_start(8)
+        head.set_margin_end(8)
+        head.set_margin_top(6)
+        head.set_margin_bottom(8)
+        mascot = Gtk.Picture.new_for_filename(str(ASSETS / "mascot-3x.png"))
+        mascot.set_size_request(48, 15)
+        mascot.set_can_shrink(False)
+        mascot.set_valign(Gtk.Align.CENTER)
+        mascot.set_accessible_role(Gtk.AccessibleRole.PRESENTATION)
+        head.append(mascot)
+        title = Gtk.Label(label="USAGE", xalign=0, hexpand=True)
+        title.add_css_class("um-title")
+        head.append(title)
+        self.status = Gtk.Label(label="", xalign=1)
+        self.status.add_css_class("um-status")
+        self.status.set_accessible_role(Gtk.AccessibleRole.STATUS)
+        head.append(self.status)
+        card.append(head)
+
+        self.cards = {}
+        for i, account in enumerate(ACCOUNTS):
+            if i:
+                rule = Gtk.Box()
+                rule.add_css_class("um-rule")
+                card.append(rule)
+            ac = AccountCard(account, self.colors)
+            card.append(ac)
+            self.cards[account["id"]] = ac
+
+        hint = Gtk.Label(label="ESC CLOSE  -  CLICK TO OPEN PAGE", xalign=0)
+        hint.add_css_class("um-hint")
+        hint.set_margin_start(8)
+        hint.set_margin_top(10)
+        hint.set_margin_bottom(4)
+        card.append(hint)
+
+        root = Gtk.Box()
+        root.set_hexpand(True)
+        root.set_vexpand(True)
+        root.append(overlay)
+        win.set_child(root)
+
+        click = Gtk.GestureClick(button=0)
+        click.connect("pressed", self.on_click)
+        root.add_controller(click)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        win.add_controller(keys)
+
+        self.window = win
+        win.present()
+        GLib.timeout_add(16, lambda: card.add_css_class("um-shown") or False)
+        self.refresh()
+
+    def on_click(self, gesture, _n, x, y):
+        ok, bounds = self.panel.compute_bounds(gesture.get_widget())
+        if ok and bounds.contains_point(Graphene.Point().init(x, y)):
+            return
+        self.quit()
+
+    def on_key(self, _ctrl, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            self.quit()
+            return True
+        return False
+
+    def entry(self, account):
+        entry = self.cache.get(account["id"]) or {}
+        if "status" in entry:  # cache written by an older version
+            entry = {"data": entry, "fetched_at": 0}
+        self.cache[account["id"]] = entry
+        return entry
+
+    def refresh(self):
+        now = time.time()
+        to_fetch = []
+        for account in ACCOUNTS:
+            entry = self.entry(account)
+            data, card = entry.get("data"), self.cards[account["id"]]
+            if now - entry.get("fetched_at", 0) < MIN_REFETCH_SECONDS:
+                card.show(data, animate=False)  # fetched seconds ago: already fresh
+            elif entry.get("retry_at", 0) > now:
+                card.show(data, stale=True, note=f"RATE LIMITED - RETRY IN {until(entry['retry_at'])}",
+                          animate=False)
+            else:
+                card.show(data, stale=True, animate=False)
+                to_fetch.append(account)
+        self.pending = len(to_fetch)
+        if not to_fetch:
+            self.status.set_label(f"UPDATED {datetime.now():%H:%M}")
+            return
+        self.dots = 0
+        self.tick_status()
+        GLib.timeout_add(320, self.tick_status)
+        for account in to_fetch:
+            fetch = fetch_claude if account["kind"] == "claude" else fetch_codex
+            threading.Thread(target=self.worker, args=(account, fetch), daemon=True).start()
+
+    def worker(self, account, fetch):
+        result = fetch(account)
+        GLib.idle_add(self.done, account, result)
+
+    def done(self, account, result):
+        entry, card = self.entry(account), self.cards[account["id"]]
+        status, data = result.get("status"), entry.get("data")
+        if status == "ok":
+            entry.update(data=result, fetched_at=time.time())
+            entry.pop("retry_at", None)
+            card.show(result, animate=True)
+        elif status == "limited":
+            entry["retry_at"] = result["retry_at"]
+            card.show(data, stale=True, plan=result.get("plan"),
+                      note=f"RATE LIMITED - RETRY IN {until(result['retry_at'])}")
+        else:
+            severity = "danger" if status == "expired" else "warn"
+            card.show(data, stale=True, plan=result.get("plan"),
+                      note=result.get("message", "UNAVAILABLE"), severity=severity)
+        self.pending -= 1
+        if self.pending == 0:
+            save_cache(self.cache)
+            self.status.set_label(f"UPDATED {datetime.now():%H:%M}")
+        return False
+
+    def tick_status(self):
+        if self.pending == 0:
+            return False
+        self.dots = (self.dots + 1) % 4
+        self.status.set_label("UPDATING" + "." * self.dots + " " * (3 - self.dots))
+        return True
+
+
+def main():
+    if not LAYER_SHELL:
+        print("claude-tracker: gtk4-layer-shell not found; install it first", file=sys.stderr)
+        return 1
+    try:
+        return UsageMenu().run([])
+    finally:
+        try:
+            with open(PIDFILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(PIDFILE)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,28 @@
+# claude-tracker accounts, shown top to bottom.
+# Copy to ~/.config/claude-tracker/config.toml (install.sh does this for you).
+#
+# type       "claude" or "codex"
+# label      name shown in the menu
+# sublabel   optional second word, shown in the accent color
+# config_dir claude only: the Claude Code config folder that holds .credentials.json
+#            (~/.claude by default; use another folder for a second account
+#            started with CLAUDE_CONFIG_DIR)
+# command    codex only: the codex binary (default "codex")
+# url        optional: page opened when you click the account
+
+[[account]]
+type = "claude"
+label = "Claude"
+config_dir = "~/.claude"
+
+# A second Claude account, for example one started with
+# CLAUDE_CONFIG_DIR=~/.claude-work claude
+# [[account]]
+# type = "claude"
+# label = "Claude"
+# sublabel = "Work"
+# config_dir = "~/.claude-work"
+
+[[account]]
+type = "codex"
+label = "Codex"

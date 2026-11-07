@@ -1,0 +1,17 @@
+/* claude-tracker:start */
+/* Pixel mascot on the bar button. Keep the image height odd so it stays pixel-sharp. */
+label.module-icon.cmodule-claude-tracker {
+    background-image: url("file://@SHARE@/mascot-bar.png");
+    background-size: 32px 11px;
+    background-repeat: no-repeat;
+    background-position: center;
+    min-width: 32px;
+    min-height: 11px;
+    color: transparent;
+}
+label.module-label.cmodule-claude-tracker {
+    margin-left: 0;
+    padding: 0;
+    min-width: 0;
+}
+/* claude-tracker:end */
